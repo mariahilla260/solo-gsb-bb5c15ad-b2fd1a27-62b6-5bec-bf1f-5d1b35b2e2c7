@@ -334,3 +334,75 @@ class HealthResponse(BaseModel):
     """健康检查响应。"""
 
     status: Literal["ok"] = "ok"
+
+
+class InsertRequest(BaseModel):
+    """POST /insert 的请求体：源 cue 列表、一条新 cue 与不可移动的 cue id 列表。"""
+
+    cues: list[Cue] = Field(
+        default_factory=list,
+        description="源 cue 列表；id 必须唯一，时间轴不得重叠（首尾相接允许）",
+    )
+    new: Cue = Field(..., description="待插入的新 cue；其 id 不得已存在于 cues")
+    locked: list[str] = Field(
+        default_factory=list,
+        description="不可移动的 cue id 列表；每个 id 都必须属于 cues，可空",
+    )
+
+
+class MovedCue(BaseModel):
+    """一条因插入碰撞而顺延的 cue 的原/新起止时间。"""
+
+    id: str = Field(..., min_length=1, description="被移动 cue 的 id")
+    old_start: float = Field(..., description="移动前的开始时间（秒）")
+    old_end: float = Field(..., description="移动前的结束时间（秒）")
+    new_start: float = Field(..., description="移动后的开始时间（秒）")
+    new_end: float = Field(..., description="移动后的结束时间（秒）")
+
+
+class InsertSuccessResponse(BaseModel):
+    """插入成功：完整时间轴（按 start 升序）与每条被移动 cue 的原/新时间。"""
+
+    status: Literal["inserted"] = "inserted"
+    cues: list[Cue]
+    moved: list[MovedCue] = Field(
+        default_factory=list, description="实际发生移动的 cue，按时间轴顺序"
+    )
+    count: int
+
+
+class InsertParamErrorResponse(BaseModel):
+    """参数无效时的 422 响应：不输出部分结果。"""
+
+    status: Literal["insert_param_error"] = "insert_param_error"
+    duplicated_ids: list[str] = Field(
+        default_factory=list, description="源 cue 列表中重复的全部 cue id（排序去重）"
+    )
+    overlaps: list[Overlap] = Field(
+        default_factory=list, description="源时间轴上的全部重叠区间"
+    )
+    existing_id: Optional[str] = Field(
+        None, description="新 cue 的 id 已存在于源列表时的该 id"
+    )
+    unknown_locked: list[str] = Field(
+        default_factory=list, description="不属于源列表的锁定 cue id（去重，按首次出现顺序）"
+    )
+
+
+class InsertFailureResponse(BaseModel):
+    """插入被拒时的 409 响应：不输出部分结果。"""
+
+    status: Literal["insert_failed"] = "insert_failed"
+    reason: Literal["overlap_previous", "locked_move"] = Field(
+        ...,
+        description=(
+            "overlap_previous：起点更早的源 cue 与新 cue 相交；"
+            "locked_move：顺延碰撞要求某个锁定 cue 移动"
+        ),
+    )
+    cue_id: Optional[str] = Field(
+        None, description="overlap_previous 时与新 cue 相交的更早 cue id"
+    )
+    locked_id: Optional[str] = Field(
+        None, description="locked_move 时首个需要移动的锁定 cue id"
+    )

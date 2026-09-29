@@ -7,6 +7,8 @@
 `POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时（重映射）。
 `POST /splice` 按一组选区从现有 cue 时间轴上剪取字幕片段，跨边界裁断后依选区顺序
 （选区可乱序、重叠或重复）拼接成一条新时间轴，并保留原 id 与选区序号。
+`POST /insert` 把一条新 cue 插入现有时间轴，与之碰撞的后续字幕保持时长逐条顺延，
+并通过锁定 id 列表保证指定 cue 不被移动。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -411,6 +413,100 @@ curl -X POST http://localhost:8000/splice \
 }
 ```
 
+### POST /insert
+
+把**一条新 cue** 插入现有 cue 时间轴，并让与之碰撞的后续字幕顺延。
+源 cue 先按 `start` 升序（平局依次按 `end`、`id`）排序，新 cue 插在**所有起点不小于
+新 cue 起点**的源 cue 之前；起点更早的源 cue 保持原位。
+
+请求体：
+
+| 字段     | 类型     | 说明                                                       |
+| -------- | -------- | ---------------------------------------------------------- |
+| `cues`   | Cue[]    | 现有源 cue 列表（可空）；**id 必须唯一**、时间轴**不得重叠**（首尾相接允许） |
+| `new`    | Cue      | 待插入的新 cue（沿用 `id` / `start` / `end` / `text` / `speaker`）；其 id **不得已存在**于 `cues` |
+| `locked` | string[] | **不可移动**的 cue id 列表（可空）；每个 id 都**必须属于** `cues`（可重复，按去重处理） |
+
+插入与顺延规则：
+
+1. 起点更早的源 cue 若与新 cue **严格相交**（交集时长 > 0，仅首尾相接不算），
+   无法通过顺延解决 → **整次拒绝**（`409 overlap_previous`，给出该更早 cue id）；
+2. 后续 cue 保持**先后顺序与自身时长**，仅在与（顺延之后的）**前一条**严格相交时
+   整体右移到前一条的 `end`；碰撞可沿时间轴**逐条传递**（穿过较小空隙，直到空隙足以吸收）；
+3. 新 cue 与前一条或后一条**首尾相接**（`end == start`）时合法，不触发拒绝、也不顺延；
+4. 若某条顺延链要求某个**锁定 cue** 移动 → **整次拒绝**（`409 locked_move`，
+   给出首个需要移动的锁定 id），不输出部分结果；锁定 cue 不需要移动时留在原位；
+5. 成功时返回**完整时间轴**（按 `start` 升序），并通过 `moved` 给出**每条实际移动
+   cue 的原、新起止时间**（`old_start` / `old_end` / `new_start` / `new_end`，按时间轴顺序）。
+
+#### 错误与响应
+
+- cue 自身 `end <= start`、端点为负、缺少字段等请求体结构问题 → `422`（FastAPI 校验）；
+- **参数无效**（源 id 重复、源时间轴重叠、新 cue id 已存在、锁定 id 不属于源列表）
+  → `422 status=insert_param_error`，一次性返回全部问题，**不输出部分结果**；
+- **插入失败**（与更早 cue 相交、锁定 cue 需要移动）→ `409 status=insert_failed`，
+  **不输出部分结果**。
+
+调用样例（`http://localhost:8000/insert`）——新 cue 与 `a` 首尾相接，把 `b`、`c`
+逐条推开（各保持 2s 时长），远处的 `d` 与锁定的 `d` 均不受影响：
+
+```bash
+curl -X POST http://localhost:8000/insert \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0.0,"end":2.0,"text":"第一条"},
+      {"id":"b","start":2.0,"end":4.0,"text":"第二条"},
+      {"id":"c","start":4.0,"end":6.0,"text":"第三条"},
+      {"id":"d","start":20.0,"end":22.0,"text":"远处字幕"}
+    ],
+    "new": {"id":"n","start":2.0,"end":3.0,"text":"新字幕","speaker":"alice"},
+    "locked": ["d"]
+  }'
+```
+
+```json
+{
+  "status": "inserted",
+  "cues": [
+    {"id": "a", "start": 0.0, "end": 2.0, "text": "第一条", "speaker": null},
+    {"id": "n", "start": 2.0, "end": 3.0, "text": "新字幕", "speaker": "alice"},
+    {"id": "b", "start": 3.0, "end": 5.0, "text": "第二条", "speaker": null},
+    {"id": "c", "start": 5.0, "end": 7.0, "text": "第三条", "speaker": null},
+    {"id": "d", "start": 20.0, "end": 22.0, "text": "远处字幕", "speaker": null}
+  ],
+  "moved": [
+    {"id": "b", "old_start": 2.0, "old_end": 4.0, "new_start": 3.0, "new_end": 5.0},
+    {"id": "c", "old_start": 4.0, "old_end": 6.0, "new_start": 5.0, "new_end": 7.0}
+  ],
+  "count": 5
+}
+```
+
+与更早 cue 相交时的 `409`（不返回时间轴）：
+
+```json
+{"status": "insert_failed", "reason": "overlap_previous", "cue_id": "a", "locked_id": null}
+```
+
+顺延碰撞要求锁定 cue 移动时的 `409`（不返回时间轴）：
+
+```json
+{"status": "insert_failed", "reason": "locked_move", "cue_id": null, "locked_id": "b"}
+```
+
+参数无效时的 `422`（示例中源 id 重复与未知锁定 id 同时返回，不返回时间轴）：
+
+```json
+{
+  "status": "insert_param_error",
+  "duplicated_ids": ["a"],
+  "overlaps": [],
+  "existing_id": null,
+  "unknown_locked": ["x"]
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -435,13 +531,14 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/insert、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   ├── retime.py     # 时间锚点分段线性校时纯逻辑
 │   ├── splice.py     # 选区剪取与顺序拼接纯逻辑
+│   ├── insert.py     # 新 cue 插入与碰撞顺延纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 80 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 101 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -1097,5 +1097,252 @@ class SpliceTests(unittest.TestCase):
         self.assertTrue(all(c["end"] > c["start"] for c in data["cues"]))
 
 
+class InsertTests(unittest.TestCase):
+    def insert(self, cues, new_cue, locked=None):
+        body = {"cues": cues, "new": new_cue, "locked": locked or []}
+        return client.post("/insert", json=body)
+
+    def test_insert_into_gap_keeps_everyone_in_place(self):
+        body_cues = [cue("a", 0, 2), cue("b", 10, 12)]
+        resp = self.insert(body_cues, cue("n", 5, 6, "new"))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "inserted")
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b"])
+        self.assertEqual(data["count"], 3)
+        self.assertEqual(data["moved"], [])
+        self.assertEqual(data["cues"][1]["text"], "new")
+
+    def test_insert_at_head_and_tail(self):
+        resp = self.insert([cue("a", 5, 7), cue("b", 7, 9)], cue("n", 0, 2))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([c["id"] for c in resp.json()["cues"]], ["n", "a", "b"])
+
+        resp = self.insert([cue("a", 0, 2)], cue("n", 10, 11))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([c["id"] for c in resp.json()["cues"]], ["a", "n"])
+
+    def test_insert_into_empty_timeline(self):
+        resp = self.insert([], cue("n", 0, 1))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["n"])
+        self.assertEqual(data["moved"], [])
+
+    def test_new_cue_goes_before_equal_start_source_cue(self):
+        # 按起点排序后，插在所有 start >= new.start 的源 cue 之前
+        resp = self.insert([cue("a", 5, 7)], cue("n", 5, 6))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual([c["id"] for c in cues], ["n", "a"])
+        # a 与新 cue 相交：右移到 n 的 end，时长保持 2s
+        self.assertEqual((cues[1]["start"], cues[1]["end"]), (6.0, 8.0))
+
+    def test_touching_is_allowed_in_both_directions(self):
+        # 新 cue 与更早 cue 首尾相接：不拒绝；与后续 cue 首尾相接：不顺延
+        resp = self.insert(
+            [cue("a", 0, 5), cue("b", 8, 10)], cue("n", 5, 8)
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b"])
+        self.assertEqual(data["moved"], [])
+
+    def test_collision_pushes_one_later_cue_to_prev_end(self):
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4), cue("c", 10, 12)],
+            cue("n", 2, 3),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [(c["id"], c["start"], c["end"]) for c in data["cues"]],
+            [("a", 0.0, 2.0), ("n", 2.0, 3.0), ("b", 3.0, 5.0), ("c", 10.0, 12.0)],
+        )
+        self.assertEqual(len(data["moved"]), 1)
+        moved = data["moved"][0]
+        self.assertEqual(
+            (moved["id"], moved["old_start"], moved["old_end"],
+             moved["new_start"], moved["new_end"]),
+            ("b", 2.0, 4.0, 3.0, 5.0),
+        )
+
+    def test_collision_propagates_through_chain_and_keeps_durations(self):
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4), cue("c", 4, 6), cue("d", 20, 22)],
+            cue("n", 2, 3),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [(c["id"], c["start"], c["end"]) for c in data["cues"]],
+            [
+                ("a", 0.0, 2.0),
+                ("n", 2.0, 3.0),
+                ("b", 3.0, 5.0),
+                ("c", 5.0, 7.0),
+                ("d", 20.0, 22.0),
+            ],
+        )
+        # 碰撞逐条传递：b 先移，c 再被（移动后的）b 推走；d 留原位
+        self.assertEqual([m["id"] for m in data["moved"]], ["b", "c"])
+        for m in data["moved"]:
+            self.assertAlmostEqual(
+                (m["new_end"] - m["new_start"]), (m["old_end"] - m["old_start"])
+            )
+
+    def test_propagation_crosses_small_gaps_until_a_gap_absorbs_it(self):
+        # b 与 n 之间的空隙小于顺延量，b 被推后继续撞上 c；d 远离不再受影响
+        resp = self.insert(
+            [cue("a", 0, 10), cue("b", 10, 11), cue("c", 11.5, 12), cue("d", 30, 31)],
+            cue("n", 10, 11.2),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [(c["id"], c["start"], c["end"]) for c in data["cues"]],
+            [
+                ("a", 0.0, 10.0),
+                ("n", 10.0, 11.2),
+                ("b", 11.2, 12.2),
+                ("c", 12.2, 12.7),
+                ("d", 30.0, 31.0),
+            ],
+        )
+        self.assertEqual([m["id"] for m in data["moved"]], ["b", "c"])
+
+    def test_moved_cues_keep_text_and_speaker(self):
+        resp = self.insert(
+            [cue("a", 0, 2, "甲", "alice"), cue("b", 2, 4, "乙", "bob")],
+            cue("n", 2, 3, "新"),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        b = [c for c in resp.json()["cues"] if c["id"] == "b"][0]
+        self.assertEqual(b["text"], "乙")
+        self.assertEqual(b["speaker"], "bob")
+
+    def test_overlap_with_earlier_cue_is_rejected_entirely(self):
+        resp = self.insert([cue("a", 0, 5)], cue("n", 4, 6))
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_failed")
+        self.assertEqual(data["reason"], "overlap_previous")
+        self.assertEqual(data["cue_id"], "a")
+        self.assertNotIn("cues", data)
+        self.assertNotIn("moved", data)
+
+    def test_earlier_overlap_takes_precedence_over_locked_move(self):
+        # 更早 cue 与新 cue 相交时直接拒绝，即便它本身是锁定 cue
+        resp = self.insert([cue("a", 0, 5), cue("b", 5, 7)], cue("n", 4, 6), ["a"])
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["reason"], "overlap_previous")
+        self.assertEqual(data["cue_id"], "a")
+
+    def test_locked_cue_not_needing_move_does_not_block(self):
+        # a 是更早 cue 且仅首尾相接、z 在远处：均无需移动，插入成功
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4), cue("z", 10, 12)],
+            cue("n", 2, 2.5),
+            ["a", "z"],
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b", "z"])
+        self.assertEqual([m["id"] for m in data["moved"]], ["b"])
+
+    def test_locked_cue_that_must_move_rejects_without_partial_output(self):
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4), cue("c", 4, 6)],
+            cue("n", 2, 3),
+            ["b"],
+        )
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_failed")
+        self.assertEqual(data["reason"], "locked_move")
+        self.assertEqual(data["locked_id"], "b")
+        self.assertNotIn("cues", data)
+
+    def test_chain_reaching_a_locked_cue_reports_that_locked_id(self):
+        # b 未锁定、先被推开；碰撞传递到锁定的 c → 返回 c
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4), cue("c", 4, 6)],
+            cue("n", 2, 3),
+            ["c"],
+        )
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["reason"], "locked_move")
+        self.assertEqual(data["locked_id"], "c")
+        self.assertNotIn("cues", data)
+
+    def test_duplicate_source_ids_is_param_error(self):
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 3, 4), cue("a", 5, 6)], cue("n", 20, 21)
+        )
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["duplicated_ids"], ["a"])
+        self.assertNotIn("cues", data)
+
+    def test_overlapping_source_timeline_is_param_error(self):
+        resp = self.insert([cue("a", 0, 5), cue("b", 4, 8)], cue("n", 20, 21))
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["duplicated_ids"], [])
+        self.assertEqual(len(data["overlaps"]), 1)
+        self.assertEqual(data["overlaps"][0]["cue_ids"], ["a", "b"])
+        self.assertNotIn("cues", data)
+
+    def test_touching_source_intervals_are_valid(self):
+        resp = self.insert([cue("a", 0, 5), cue("b", 5, 8)], cue("n", 5, 6))
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_new_cue_id_already_exists_is_param_error(self):
+        resp = self.insert([cue("a", 0, 2)], cue("a", 5, 6))
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["existing_id"], "a")
+
+    def test_unknown_locked_ids_are_param_error_deduped_in_order(self):
+        resp = self.insert(
+            [cue("a", 0, 2), cue("b", 2, 4)],
+            cue("n", 10, 11),
+            ["x", "a", "y", "x"],
+        )
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["unknown_locked"], ["x", "y"])
+
+    def test_param_errors_are_collected_together(self):
+        # 新 id 已存在与未知锁定 id 同时报告
+        resp = self.insert([cue("a", 0, 2)], cue("a", 5, 6), ["nope"])
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["existing_id"], "a")
+        self.assertEqual(data["unknown_locked"], ["nope"])
+
+    def test_malformed_body_and_invalid_cues_are_422(self):
+        # cue 自身 end <= start
+        resp = client.post(
+            "/insert", json={"cues": [cue("a", 5, 2)], "new": cue("n", 0, 1)}
+        )
+        self.assertEqual(resp.status_code, 422)
+        # 缺少必填字段 new
+        resp = client.post("/insert", json={"cues": []})
+        self.assertEqual(resp.status_code, 422)
+        # 新 cue 端点为负
+        resp = client.post(
+            "/insert",
+            json={"cues": [], "new": {"id": "n", "start": -1, "end": 2, "text": "t"}},
+        )
+        self.assertEqual(resp.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()
