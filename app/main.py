@@ -6,9 +6,15 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .insert import insert_cue
 from .merge import find_overlaps, resolve_three_way, three_way_merge
 from .models import (
     HealthResponse,
+    InsertLockedErrorResponse,
+    InsertOverlapErrorResponse,
+    InsertParamErrorResponse,
+    InsertRequest,
+    InsertSuccessResponse,
     MergeConflictResponse,
     MergeOverlapResponse,
     MergeRequest,
@@ -36,7 +42,9 @@ app = FastAPI(
         "输出解决后的时间轴；"
         "POST /retime 按 source/target 时间锚点对 cue 时间轴做分段线性校时；"
         "POST /splice 按选区列表从现有 cue 时间轴剪取字幕，"
-        "并按选区顺序拼接成一条新时间轴。"
+        "并按选区顺序拼接成一条新时间轴；"
+        "POST /insert 把一条新 cue 插入现有时间轴，"
+        "并让与之碰撞的后续字幕自动顺延（锁定 cue 不可移动）。"
     ),
     version=__version__,
 )
@@ -194,4 +202,82 @@ def splice(request: SpliceRequest):
 
     return SpliceSuccessResponse(
         cues=result.cues, count=len(result.cues), duration=result.duration
+    )
+
+
+@app.post(
+    "/insert",
+    tags=["insert"],
+    response_model=InsertSuccessResponse,
+    responses={
+        422: {
+            "model": InsertParamErrorResponse,
+            "description": (
+                "插入参数无效：源 cue id 重复、源时间轴重叠、"
+                "新 cue id 已存在或锁定 id 不属于源列表；"
+                "不输出部分结果。请求体结构校验失败（时间为负、"
+                "end <= start 等）同样返回 422。"
+            ),
+        },
+        409: {
+            "model": InsertOverlapErrorResponse | InsertLockedErrorResponse,
+            "description": (
+                "插入失败且不输出部分结果：更早的源 cue 与新 cue 相交"
+                "（preceding_overlap），或顺延要求某个锁定 cue 移动"
+                "（locked_move）。"
+            ),
+        },
+    },
+)
+def insert(request: InsertRequest):
+    """把新 cue 插入时间轴，碰撞的后续 cue 保持时长逐条顺延。"""
+    result = insert_cue(request.cues, request.cue, request.locked_ids)
+
+    if result.param_error:
+        problems: list[str] = []
+        if result.duplicated_ids:
+            problems.append(f"源 cue id 重复: {', '.join(result.duplicated_ids)}")
+        if result.overlaps:
+            problems.append("源时间轴存在重叠")
+        if result.existing_id is not None:
+            problems.append(f"新 cue id 已存在: {result.existing_id}")
+        if result.unknown_locked:
+            problems.append(
+                f"锁定 id 不属于源列表: {', '.join(result.unknown_locked)}"
+            )
+        content = InsertParamErrorResponse(
+            duplicated_ids=result.duplicated_ids,
+            overlaps=result.overlaps,
+            existing_id=result.existing_id,
+            unknown_locked=result.unknown_locked,
+            message="；".join(problems),
+        ).model_dump()
+        return JSONResponse(status_code=422, content=content)
+
+    if result.preceding_overlap is not None:
+        overlap = result.preceding_overlap
+        earlier_id, new_id = overlap.cue_ids
+        content = InsertOverlapErrorResponse(
+            cue_id=earlier_id,
+            overlap=overlap,
+            message=(
+                f"更早的 cue {earlier_id} 与新 cue {new_id} 相交"
+                f"（{overlap.start}–{overlap.end}），更早的 cue 不允许移动，"
+                "整次插入被拒绝"
+            ),
+        ).model_dump()
+        return JSONResponse(status_code=409, content=content)
+
+    if result.locked_ids:
+        ids = result.locked_ids
+        content = InsertLockedErrorResponse(
+            locked_ids=ids,
+            message=(
+                "顺延要求移动锁定 cue（不可移动）: " + ", ".join(ids)
+            ),
+        ).model_dump()
+        return JSONResponse(status_code=409, content=content)
+
+    return InsertSuccessResponse(
+        cues=result.cues, count=len(result.cues), moved=result.moved
     )

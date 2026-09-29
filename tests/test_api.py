@@ -1097,5 +1097,337 @@ class SpliceTests(unittest.TestCase):
         self.assertTrue(all(c["end"] > c["start"] for c in data["cues"]))
 
 
+def new_cue(id, start, end, text="new", speaker=None):
+    data = {"id": id, "start": start, "end": end, "text": text}
+    if speaker is not None:
+        data["speaker"] = speaker
+    return data
+
+
+class InsertTests(unittest.TestCase):
+    def test_insert_into_empty_timeline(self):
+        body = {"cues": [], "cue": new_cue("n", 1, 3)}
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "inserted")
+        self.assertEqual([c["id"] for c in data["cues"]], ["n"])
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["moved"], [])
+
+    def test_insert_without_collision_keeps_everyone_in_place(self):
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 10, 12)],
+            "cue": new_cue("n", 5, 6),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b"])
+        self.assertEqual(data["moved"], [])
+        # 现有 cue 时间原样保留
+        self.assertEqual(
+            (data["cues"][2]["start"], data["cues"][2]["end"]), (10, 12)
+        )
+
+    def test_touching_at_start_does_not_shift(self):
+        # 后续 cue 起点 == 新 cue end：首尾相接，不移动
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 5, 7)],
+            "cue": new_cue("n", 3, 5),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b"])
+        self.assertEqual(
+            (data["cues"][2]["start"], data["cues"][2]["end"]), (5, 7)
+        )
+        self.assertEqual(data["moved"], [])
+
+    def test_collision_shifts_one_following_cue_to_prev_end(self):
+        body = {
+            "cues": [
+                cue("a", 0, 2),
+                cue("b", 4, 6, "second"),
+                cue("c", 10, 12),
+            ],
+            "cue": new_cue("n", 3, 5),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b", "c"])
+        # b 与 n 在 4–5 相交 → 右移到 5，时长保持 2 → 5–7；与 c 不相交
+        b = next(c for c in data["cues"] if c["id"] == "b")
+        self.assertAlmostEqual(b["start"], 5.0)
+        self.assertAlmostEqual(b["end"], 7.0)
+        self.assertEqual(b["text"], "second")
+        self.assertEqual(len(data["moved"]), 1)
+        moved = data["moved"][0]
+        self.assertEqual(moved["id"], "b")
+        self.assertAlmostEqual(moved["original_start"], 4.0)
+        self.assertAlmostEqual(moved["original_end"], 6.0)
+        self.assertAlmostEqual(moved["start"], 5.0)
+        self.assertAlmostEqual(moved["end"], 7.0)
+
+    def test_collision_propagates_through_chain_preserving_durations(self):
+        body = {
+            "cues": [
+                cue("a", 0, 1),
+                cue("b", 3, 5),
+                cue("c", 5, 7),
+                cue("d", 7, 9),
+                cue("e", 20, 21),
+            ],
+            "cue": new_cue("n", 2, 4),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        times = {c["id"]: (c["start"], c["end"]) for c in data["cues"]}
+        # n: 2–4；b 与 n 相交 → 4–6；c 原 5–7 与 b(4–6) 相交 → 6–8；
+        # d 原 7–9 与 c(6–8) 相交 → 8–10；e 不相交
+        self.assertEqual(times["n"], (2, 4))
+        self.assertEqual(times["b"], (4, 6))
+        self.assertEqual(times["c"], (6, 8))
+        self.assertEqual(times["d"], (8, 10))
+        self.assertEqual(times["e"], (20, 21))
+        self.assertEqual([m["id"] for m in data["moved"]], ["b", "c", "d"])
+        for m in data["moved"]:
+            self.assertAlmostEqual(
+                (m["original_end"] - m["original_start"]),
+                (m["end"] - m["start"]),
+            )
+        self.assertEqual(data["count"], 6)
+
+    def test_same_start_as_following_cue_counts_as_collision(self):
+        # 起点相同的源 cue 属于后续段，新 cue 排在其之前；相交 → 顺延
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 5, 6)],
+            "cue": new_cue("n", 5, 5.5),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([c["id"] for c in data["cues"]], ["a", "n", "b"])
+        b = next(c for c in data["cues"] if c["id"] == "b")
+        self.assertAlmostEqual(b["start"], 5.5)
+        self.assertAlmostEqual(b["end"], 6.5)
+
+    def test_preceding_touch_is_allowed(self):
+        # 更早 cue 的 end == 新 cue start：首尾相接，允许
+        body = {
+            "cues": [cue("a", 0, 3), cue("b", 10, 11)],
+            "cue": new_cue("n", 3, 5),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [c["id"] for c in resp.json()["cues"]], ["a", "n", "b"]
+        )
+
+    def test_preceding_overlap_rejects_entire_insertion(self):
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 10, 12)],
+            "cue": new_cue("n", 4, 6),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_error")
+        self.assertEqual(data["reason"], "preceding_overlap")
+        self.assertEqual(data["cue_id"], "a")
+        self.assertEqual(data["overlap"]["cue_ids"], ["a", "n"])
+        self.assertAlmostEqual(data["overlap"]["start"], 4.0)
+        self.assertAlmostEqual(data["overlap"]["end"], 5.0)
+        self.assertAlmostEqual(data["overlap"]["overlap"], 1.0)
+        self.assertNotIn("cues", data)
+
+    def test_preceding_overlap_with_locked_cue_still_reports_overlap(self):
+        # 更早 cue 即使被锁定，相交原因仍是 preceding_overlap（它根本不参与顺延）
+        body = {
+            "cues": [cue("a", 0, 5)],
+            "cue": new_cue("n", 4, 6),
+            "locked_ids": ["a"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["reason"], "preceding_overlap")
+
+    def test_unlocked_shifts_succeed_even_with_locked_ids_present(self):
+        body = {
+            "cues": [cue("a", 0, 1), cue("b", 3, 5), cue("c", 5, 7)],
+            "cue": new_cue("n", 2, 4),
+            "locked_ids": ["a"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(
+            [c["id"] for c in data["cues"]], ["a", "n", "b", "c"]
+        )
+        self.assertEqual([m["id"] for m in data["moved"]], ["b", "c"])
+
+    def test_locked_cue_need_to_move_returns_its_id_without_output(self):
+        body = {
+            "cues": [cue("a", 0, 1), cue("b", 3, 5), cue("c", 5, 7)],
+            "cue": new_cue("n", 2, 4),
+            "locked_ids": ["b"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_error")
+        self.assertEqual(data["reason"], "locked_move")
+        self.assertEqual(data["locked_ids"], ["b"])
+        self.assertNotIn("cues", data)
+        self.assertNotIn("moved", data)
+
+    def test_locked_further_down_chain_is_reported_in_timeline_order(self):
+        # b 未锁定、c/d 锁定；碰撞链传递到两者时都要报告，按时间轴顺序去重
+        body = {
+            "cues": [
+                cue("a", 0, 1),
+                cue("b", 3, 5),
+                cue("c", 5, 7),
+                cue("d", 7, 9),
+            ],
+            "cue": new_cue("n", 2, 4),
+            "locked_ids": ["d", "c"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["reason"], "locked_move")
+        self.assertEqual(data["locked_ids"], ["c", "d"])
+        self.assertNotIn("cues", data)
+
+    def test_locked_cue_after_chain_break_is_not_reported(self):
+        # b 被推后到 5–7（与 c 首尾相接），链中断；d 不会移动
+        body = {
+            "cues": [cue("a", 0, 1), cue("b", 3, 5), cue("c", 7, 9), cue("d", 9, 11)],
+            "cue": new_cue("n", 2, 5),
+            "locked_ids": ["c", "d"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual([m["id"] for m in data["moved"]], ["b"])
+        self.assertEqual(
+            [c["id"] for c in data["cues"]], ["a", "n", "b", "c", "d"]
+        )
+
+    def test_duplicate_source_ids_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 3, 4), cue("a", 5, 6)],
+            "cue": new_cue("n", 8, 9),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["duplicated_ids"], ["a"])
+        self.assertNotIn("cues", data)
+
+    def test_source_overlap_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 4, 6)],
+            "cue": new_cue("n", 10, 11),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(len(data["overlaps"]), 1)
+        self.assertEqual(data["overlaps"][0]["cue_ids"], ["a", "b"])
+
+    def test_source_touching_intervals_are_valid(self):
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 5, 8)],
+            "cue": new_cue("n", 10, 11),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_new_cue_id_already_exists_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0, 2)],
+            "cue": new_cue("a", 5, 6),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["existing_id"], "a")
+
+    def test_unknown_locked_id_is_param_error(self):
+        body = {
+            "cues": [cue("a", 0, 2)],
+            "cue": new_cue("n", 5, 6),
+            "locked_ids": ["ghost"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["status"], "insert_param_error")
+        self.assertEqual(data["unknown_locked"], ["ghost"])
+
+    def test_multiple_param_problems_reported_together(self):
+        body = {
+            "cues": [cue("a", 0, 5), cue("a", 4, 6)],
+            "cue": new_cue("a", 10, 11),
+            "locked_ids": ["ghost", "ghost2"],
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 422)
+        data = resp.json()
+        self.assertEqual(data["duplicated_ids"], ["a"])
+        self.assertEqual(data["existing_id"], "a")
+        self.assertEqual(data["unknown_locked"], ["ghost", "ghost2"])
+        # 源 id 重复时不再计算重叠（与 /splice 一致）
+        self.assertEqual(data["overlaps"], [])
+        self.assertTrue(data["message"])
+
+    def test_invalid_new_cue_interval_is_422_from_body_validation(self):
+        body = {
+            "cues": [cue("a", 0, 2)],
+            "cue": new_cue("n", 5, 4),
+        }
+        self.assertEqual(client.post("/insert", json=body).status_code, 422)
+
+    def test_new_cue_fields_preserved_including_speaker(self):
+        body = {
+            "cues": [cue("a", 0, 2), cue("b", 4, 6)],
+            "cue": new_cue("n", 3, 5, text="你好", speaker="alice"),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        n = next(c for c in resp.json()["cues"] if c["id"] == "n")
+        self.assertEqual(n["text"], "你好")
+        self.assertEqual(n["speaker"], "alice")
+        # 被顺延的 b 保留自身 text/speaker
+        b = next(c for c in resp.json()["cues"] if c["id"] == "b")
+        self.assertEqual(b["text"], "t")
+        self.assertIsNone(b["speaker"])
+
+    def test_result_timeline_is_sorted_and_non_overlapping(self):
+        body = {
+            "cues": [
+                cue("d", 30, 31),
+                cue("a", 0, 1),
+                cue("c", 10, 11),
+                cue("b", 5, 6),
+            ],
+            "cue": new_cue("n", 6, 12),
+        }
+        resp = client.post("/insert", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual([c["id"] for c in cues], ["a", "b", "n", "c", "d"])
+        for prev, nxt in zip(cues, cues[1:]):
+            self.assertLessEqual(prev["end"], nxt["start"])
+
+
 if __name__ == "__main__":
     unittest.main()

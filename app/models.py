@@ -330,6 +330,84 @@ class SpliceParamErrorResponse(BaseModel):
     )
 
 
+class InsertRequest(BaseModel):
+    """POST /insert 的请求体：现有 cue 列表、一条新 cue 与不可移动的锁定 id 列表。"""
+
+    cues: list[Cue] = Field(
+        default_factory=list,
+        description="现有时间轴；id 不得重复，cue 之间不得重叠（首尾相接允许）",
+    )
+    cue: Cue = Field(..., description="待插入的新 cue；其 id 不得已存在于 cues")
+    locked_ids: list[str] = Field(
+        default_factory=list,
+        description="不可移动的 cue id 列表；每个 id 都必须属于 cues",
+    )
+
+
+class MovedCue(BaseModel):
+    """插入过程中被右移顺延的一条源 cue：记录其原起止与新起止。"""
+
+    id: str = Field(..., description="被移动的源 cue id")
+    original_start: float = Field(..., description="右移前的起点（秒）")
+    original_end: float = Field(..., description="右移前的终点（秒）")
+    start: float = Field(..., description="右移后的起点（秒）")
+    end: float = Field(..., description="右移后的终点（秒），区间时长与原来一致")
+
+
+class InsertSuccessResponse(BaseModel):
+    """插入成功：返回完整时间轴及每条被移动 cue 的原、新起止时间。"""
+
+    status: Literal["inserted"] = "inserted"
+    cues: list[Cue] = Field(..., description="插入（并顺延后）的完整时间轴，按开始时间排序")
+    count: int
+    moved: list[MovedCue] = Field(
+        default_factory=list,
+        description="每条实际被移动 cue 的原/新起止时间，按时间轴顺序；新 cue 不在此列",
+    )
+
+
+class InsertParamErrorResponse(BaseModel):
+    """插入参数无效时的 422 响应：收集全部问题，不输出部分结果。"""
+
+    status: Literal["insert_param_error"] = "insert_param_error"
+    duplicated_ids: list[str] = Field(
+        default_factory=list, description="源时间轴中重复的全部 cue id（排序去重）"
+    )
+    overlaps: list[Overlap] = Field(
+        default_factory=list, description="源时间轴上的全部重叠区间"
+    )
+    existing_id: Optional[str] = Field(
+        None, description="新 cue 的 id 已存在于源列表时给出该 id"
+    )
+    unknown_locked: list[str] = Field(
+        default_factory=list,
+        description="locked_ids 中不属于源列表的全部 id（排序去重）",
+    )
+    message: str = Field(..., description="参数无效原因的文字说明")
+
+
+class InsertOverlapErrorResponse(BaseModel):
+    """更早的源 cue 必须保持原位却与新 cue 相交时的 409 响应：不输出部分结果。"""
+
+    status: Literal["insert_error"] = "insert_error"
+    reason: Literal["preceding_overlap"] = "preceding_overlap"
+    cue_id: str = Field(..., description="与新 cue 相交、且不允许移动的更早 cue id")
+    overlap: Overlap = Field(..., description="该 cue 与新 cue 的重叠区间")
+    message: str
+
+
+class InsertLockedErrorResponse(BaseModel):
+    """顺延要求某个锁定 cue 移动时的 409 响应：返回相关 id，不输出部分结果。"""
+
+    status: Literal["insert_error"] = "insert_error"
+    reason: Literal["locked_move"] = "locked_move"
+    locked_ids: list[str] = Field(
+        ...,
+        description="若执行顺延则需要移动的全部锁定 cue id（按时间轴顺序、去重）",
+    )
+    message: str
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 

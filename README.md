@@ -7,6 +7,8 @@
 `POST /retime` 则按 source/target 时间锚点对 cue 时间轴做分段线性校时（重映射）。
 `POST /splice` 按一组选区从现有 cue 时间轴上剪取字幕片段，跨边界裁断后依选区顺序
 （选区可乱序、重叠或重复）拼接成一条新时间轴，并保留原 id 与选区序号。
+`POST /insert` 把一条新 cue 插入现有时间轴，与之碰撞的后续字幕保持时长自动顺延；
+通过 `locked_ids` 声明不可移动的 cue，顺延触及锁定 cue 或更早 cue 与新 cue 相交时整次拒绝。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -411,6 +413,138 @@ curl -X POST http://localhost:8000/splice \
 }
 ```
 
+### POST /insert
+
+把一条**新 cue** 插入现有时间轴：源 cue 按起点排序后，新 cue 插到所有
+「起点不小于新 cue 起点」的源 cue 之前；与新 cue 碰撞的后续 cue 保持先后顺序
+与各自时长自动右移，碰撞可逐条向后传递。`locked_ids` 声明不可移动的 cue，
+顺延一旦要求锁定 cue 移动即整次拒绝。
+
+请求体：
+
+| 字段         | 类型     | 说明                                                                                          |
+| ------------ | -------- | --------------------------------------------------------------------------------------------- |
+| `cues`       | Cue[]    | 现有时间轴（可空）；结构同 `/merge` 的 Cue，要求 `end > start`、**id 不得重复**、cue 之间**不得重叠** |
+| `cue`        | Cue      | 待插入的新 cue（单个对象，非列表）；其 `id` **不得已存在**于 `cues`                            |
+| `locked_ids` | string[] | 不可移动的 cue id 列表（可省略，默认空）；每个 id **必须属于** `cues`                           |
+
+插入与顺延规则：
+
+1. 源 cue 按 `start` 升序（平局依次按 `end`、`id`）排序；起点 **< 新 cue start** 的为
+   「更早 cue」，起点 **≥ 新 cue start** 的为「后续 cue」，新 cue 位于两组之间；
+2. 更早 cue **保持原位**：若其中某条与新 cue **严格相交**（重叠时长 > 0，仅首尾相接
+   `end == start` 不算），整次拒绝（`409 preceding_overlap`）——更早 cue 不参与顺延；
+3. 后续 cue 逐条处理：仅当与**前一条**（第一条的前一条是新 cue）严格相交时，
+   整体右移到前一条的 `end`，区间**时长不变**；首尾相接不移动；
+4. 移动可逐条传递：后一条与移动后的前一条相交则继续右移；一旦某条无需移动
+   （与前一条首尾相接或已有间隙），碰撞链即结束，再往后的 cue 全部保持原位；
+5. 若顺延要求**任何锁定 cue** 移动，收集全部受影响锁定 id（按时间轴顺序、去重），
+   整次拒绝（`409 locked_move`），**不输出部分结果**；
+6. 成功时返回完整时间轴（按开始时间排序），以及 `moved`：每条**实际被移动** cue 的
+   `original_start` / `original_end`（原起止）与 `start` / `end`（新起止）；
+   新 cue 与未移动 cue 不出现在 `moved` 中。
+
+#### 错误（不输出部分结果）
+
+- 新 cue 或源 cue 时间为负、`end <= start` 等请求体结构问题 → `422`（FastAPI 校验）；
+- **参数无效** → `422 status=insert_param_error`，一次性收集全部问题并给出 `message`：
+  - `duplicated_ids`：源 cue id 重复（排序去重）；
+  - `overlaps`：源时间轴重叠区间（源 id 重复时不再重复计算重叠）；
+  - `existing_id`：新 cue id 已存在于源列表；
+  - `unknown_locked`：`locked_ids` 中不属于源列表的 id（排序去重）；
+- **更早 cue 与新 cue 相交** → `409 status=insert_error, reason=preceding_overlap`，
+  返回 `cue_id`（相交的更早 cue）及 `overlap` 重叠区间；
+- **顺延要求锁定 cue 移动** → `409 status=insert_error, reason=locked_move`，
+  返回需要移动的全部 `locked_ids`。
+
+调用样例（`http://localhost:8000/insert`）——碰撞逐条传递：
+
+```bash
+curl -X POST http://localhost:8000/insert \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0,"end":1,"text":"早"},
+      {"id":"b","start":3,"end":5,"text":"二"},
+      {"id":"c","start":5,"end":7,"text":"三"},
+      {"id":"d","start":7,"end":9,"text":"四"}
+    ],
+    "cue": {"id":"n","start":2,"end":4,"text":"新"},
+    "locked_ids": ["a"]
+  }'
+```
+
+新 cue `n`（2–4）先把 `b` 从 3–5 右移到 4–6，`c` 再被推到 6–8，`d` 被推到 8–10；
+各条时长不变，`a` 未参与移动，返回完整时间轴与每条被移动 cue 的原/新起止：
+
+```json
+{
+  "status": "inserted",
+  "cues": [
+    {"id":"a","start":0.0,"end":1.0,"text":"早","speaker":null},
+    {"id":"n","start":2.0,"end":4.0,"text":"新","speaker":null},
+    {"id":"b","start":4.0,"end":6.0,"text":"二","speaker":null},
+    {"id":"c","start":6.0,"end":8.0,"text":"三","speaker":null},
+    {"id":"d","start":8.0,"end":10.0,"text":"四","speaker":null}
+  ],
+  "count": 5,
+  "moved": [
+    {"id":"b","original_start":3.0,"original_end":5.0,"start":4.0,"end":6.0},
+    {"id":"c","original_start":5.0,"original_end":7.0,"start":6.0,"end":8.0},
+    {"id":"d","original_start":7.0,"original_end":9.0,"start":8.0,"end":10.0}
+  ]
+}
+```
+
+顺延触及锁定 cue 时的 `409`（不返回 cues / moved）：
+
+```bash
+curl -X POST http://localhost:8000/insert \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id":"a","start":0,"end":1,"text":"早"},
+      {"id":"b","start":3,"end":5,"text":"二"}
+    ],
+    "cue": {"id":"n","start":2,"end":4,"text":"新"},
+    "locked_ids": ["b"]
+  }'
+```
+
+```json
+{
+  "status": "insert_error",
+  "reason": "locked_move",
+  "locked_ids": ["b"],
+  "message": "顺延要求移动锁定 cue（不可移动）: b"
+}
+```
+
+更早 cue 与新 cue 相交时的 `409`：
+
+```json
+{
+  "status": "insert_error",
+  "reason": "preceding_overlap",
+  "cue_id": "a",
+  "overlap": {"cue_ids": ["a", "n"], "start": 4.0, "end": 5.0, "overlap": 1.0},
+  "message": "更早的 cue a 与新 cue n 相交（4.0–5.0），更早的 cue 不允许移动，整次插入被拒绝"
+}
+```
+
+参数无效（下例同时存在新 id 已存在与未知锁定 id）时的 `422`：
+
+```json
+{
+  "status": "insert_param_error",
+  "duplicated_ids": [],
+  "overlaps": [],
+  "existing_id": "a",
+  "unknown_locked": ["x"],
+  "message": "新 cue id 已存在: a；锁定 id 不属于源列表: x"
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -435,13 +569,14 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/splice、/insert、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
 │   ├── retime.py     # 时间锚点分段线性校时纯逻辑
 │   ├── splice.py     # 选区剪取与顺序拼接纯逻辑
+│   ├── insert.py     # 新 cue 插入与碰撞顺延纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 80 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
